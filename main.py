@@ -6,6 +6,7 @@ processes the data, and sends it to a specified API endpoint to create users in 
 It handles errors and logs the results of each API call.
 """
 
+import random
 from time import sleep
 import pandas as pd
 import requests
@@ -18,10 +19,15 @@ load_dotenv()
 #Configs
 #===== TESTING in Localhost=====
 BASE_URL="http://localhost:19081"
-API_URL = f"{BASE_URL}/createuser"
 #===== PRODUCTION =====
-# BASE_URL = "https://staging.hillcroftinsurance.com/"
+# BASE_URL = "https://staging.hillcroftinsurance.com"
 # API_URL = f"{BASE_URL}/core/createuser"
+
+logging.basicConfig(
+    filename='app.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 SKEY = os.getenv("SKEY")
 headers = {
     "Accept": "application/json",
@@ -41,14 +47,21 @@ def read_and_clean_excel(agents_file_path):
             df.columns
             .str.replace('\n', ' ')
             .str.strip()
-            .str.replace(' ', '_')
+            .str.replace(' ', '')
+            .str.replace('_', '')
             .str.upper()
         )
         # Clean and format PHONE column to E.164 format
+        if ("PHONE" not in df.columns):
+            dummy = f"+2547{random.randint(10000000, 99999999)}"
+            df["PHONE"] = dummy
+
         if "PHONE" in df.columns:
-            df["PHONE"] = df["PHONE"].astype(str).str.replace(r"[^\d]", "", regex=True)
-            df["PHONE"] = df["PHONE"].apply(lambda x: f"+254{x[-9:]}"
-                                            if x.startswith("7") or len(x) >= 9 else f"+254{x}")
+            df["PHONE"] = df["PHONE"]\
+                .astype(str).str.replace(r"[^\d]", "", regex=True)
+            df["PHONE"] = df["PHONE"]\
+                .apply(lambda x: f"+254{x[-9:]}"
+                       if x.startswith("7") or len(x) >= 9 else f"+254{x}")
         return df
     except Exception as e:
         logging.error(f"Error reading Excel file: {e}")
@@ -66,64 +79,85 @@ def prepare_agents_payload(df):
             "phone": str(row["PHONE"]),
             "email": row["EMAIL"],
             "agency": {
-                "supplierNumber": row["SALES__CODE"]
+                "debitNumber": row["SALESCODE"],
+                "branchName": row["BRANCH"],
             }
         }
-
-        # print(f"\n Payload for USER_NO {i + 1} Name {row['SALESPERSON']}:")
-        # print(payload)
         payloads.append(payload)
-        #print(payloads)
     return payloads
 
 def create_user(payload):
     """
     Sends a POST request to the API endpoint with the payload.
-    Skips if the user already exists.
-    Logs or continues on other errors.
+    Returns (success: bool, email: str) for tracking.
     """
     try:
-        response = requests.post(API_URL, headers=headers, json=payload)
+        response = requests.post(BASE_URL + "/createuser",
+                                 headers=headers, json=payload)
         sleep(1)
-
         try:
             resp_json = response.json()
             status = resp_json.get("Status", 0)
             message = resp_json.get("Message", "")
+            email = payload.get("email", "N/A")
 
-            # Check if it's truly "user already exists"
             if status == 508 and "EMAIL_EXISTS" in message:
-                print(f"User already exists: {payload['email']} — skipping.")
-                return
+                logging.warning(f"Status: {status} - Email: {email} - Message: {message}")
+                logging.warning(f"User already exists -> Skipping")
+                return False, email
 
-            # Handle other known issues
             if "INVALID_PHONE_NUMBER" in message:
-                print(f"Invalid phone number for {payload['email']}: {message}")
-                return
+                logging.warning(f"Status: {status} - Email: {email} - Invalid phone: {message}")
+                return False, email
 
-            # Unknown error still logged
             if status != 200:
-                print(f"Unexpected error for {payload['email']}: {message}")
-                return
+                logging.error(f"Status: {status} - Email: {email} - Unexpected error: {message}")
+                return False, email
 
-            print(f"Created USER: {resp_json}")
+            logging.info(f"Status: {status} - User {email} created successfully")
+            return True, email
 
         except ValueError:
-            print(f"Non-JSON response (status {response.status_code}): {response.text}")
+            email = payload.get('email', 'N/A')
+            logging.error(f"Non-JSON response: for {email} (HTTP {response.status_code}): {response.text}")
+            return False, email
 
     except RequestException as e:
-        print(f"🚨 Request error for {payload['email']}: {e}")
+        email = payload.get('email', 'N/A')
+        logging.error(f"Request error for {email}: {e}")
+        return False, email
 
 
+def process_payloads(payloads):
+    """
+    Processes each payload and logs the result.
+    Returns a list of failed emails.
+    """
+    failed_emails = []
+    for payload in payloads:
+        success, email = create_user(payload)
+        if not success:
+            failed_emails.append(email)
+    return failed_emails
 """
 Main function to read the Excel file and prepare payloads.
 """
 def main():
     df = read_and_clean_excel(agents_file_path)
     user_payload = prepare_agents_payload(df)
-
-    for payload in user_payload:
-        create_user(payload)
+    print(f"\nCreating users.... Please wait...\n")
+    logging.info("Starting user creation process")
+    logging.info(f"Total users to create: {len(user_payload)}")
+    failed_emails = process_payloads(user_payload)
+    created_count = len(user_payload) - len(failed_emails)
+    logging.info(f"Total users created: {created_count}")
+    logging.info(f"Total users failed to be created: {len(failed_emails)}")
+    print(f"Users created. Check log file at: {os.path.abspath('app.log')}\n")
+    if failed_emails:
+        logging.warning("Failed to create the following users:")
+        for email in failed_emails:
+            logging.warning(email)
+    logging.info("User creation process completed.")
 
 """
 Entry point of the script.
